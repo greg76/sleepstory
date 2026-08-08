@@ -1,0 +1,11 @@
+mlx-audio==0.4.7
+mlx-lm==0.31.3
+espeakng-loader==0.2.4
+phonemizer==3.3.0
+phonemizer-fork==3.3.2
+kokoro==0.9.4
+numpy==2.4.4
+num2words==0.5.14
+misaki==0.9.4
+spacy==3.8.14
+spacy-curated-transformers==0.3.1
