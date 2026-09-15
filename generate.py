@@ -16,24 +16,25 @@ from mlx_audio.tts.utils import load_model as load_tts
 from mlx_lm import generate, load
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
-# Due to some internal errors with misaki originally had to do some
-# monkey-patching of the phonemizer to fix AttributeError in
-# misaki/espeak.py Now the current version seems to be fixed.
-# from phonemizer.backend.espeak.wrapper import EspeakWrapper
-# if not hasattr(EspeakWrapper, "set_data_path"):
-#    setattr(EspeakWrapper, "set_data_path", lambda _: None)
+# Story/token generation parameters
+TEMP = 0.7
+TOP_P = 0.9
+REPETITION_PENALTY = 1.05
+REPETITION_CONTEXT_SIZE = 1024
 
 # Configuration
-BACKGROUND_SOUND = Path("rain.m4a")
-BACKGROUND_VOLUME = 0.3
+BACKGROUND_SOUND = None # Path("rain.m4a")
+BACKGROUND_VOLUME = 0.2
 VOICE = "bm_george"
+LANG = "b"
+SPEED = 0.8
 OUTPUT_FOLDER = Path("stories")
 PROMPT_FILE = Path("PROMPT.md")
 
 # Speech normalization
-TARGET_LOUDNESS = -16
-MAX_TRUE_PEAK = -1.5
-LOUDNESS_RANGE = 11
+TARGET_LOUDNESS = -23
+MAX_TRUE_PEAK = -2
+LOUDNESS_RANGE = 7
 
 # Models
 #LLM_PATH = "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
@@ -102,10 +103,10 @@ def generate_story() -> dict[str, Any]:
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    sampler = make_sampler(temp=0.7, top_p=0.9)
+    sampler = make_sampler(temp=TEMP, top_p=TOP_P)
     logits_processors = make_logits_processors(
-        repetition_penalty=1.03,
-        repetition_context_size=1024,
+        repetition_penalty=REPETITION_PENALTY,
+        repetition_context_size=REPETITION_CONTEXT_SIZE,
     )
 
     print("--- Generating Story (this may take a minute) ---")
@@ -176,7 +177,7 @@ def write_audio(filename: Path, title: str, story: str) -> float:
     print(f"--- Generating Audio: {title} ---")
     try:
         assert process.stdin is not None
-        for result in tts_model.generate(story, voice=VOICE, lang_code="b", speed=0.8):
+        for result in tts_model.generate(story, voice=VOICE, lang_code=LANG, speed=SPEED):
             audio_np = np.array(result.audio)
             samples = (audio_np * 32767).astype(np.int16).tobytes()
             total_samples += len(samples) / 2
