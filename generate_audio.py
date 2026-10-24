@@ -1,234 +1,252 @@
-#! python3
+#!/usr/bin/env python3
+"""Narrate a UTF-8 text file or stdin as an M4B audiobook."""
 
+import argparse
 import contextlib
-import io
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 
-import espeakng_loader
-import numpy as np
-from mlx_audio.tts.utils import load_model as load_tts
-from mlx_lm import generate, load
-from mlx_lm.sample_utils import make_logits_processors, make_sampler
-
-# Story/token generation parameters
-TEMP = 0.7
-TOP_P = 0.9
-REPETITION_PENALTY = 1.05
-REPETITION_CONTEXT_SIZE = 1024
-
-# Configuration
-BACKGROUND_SOUND = None # Path("rain.m4a")
-BACKGROUND_VOLUME = 0.2
-VOICE = "bm_george"
-LANG = "b"
-SPEED = 0.8
-OUTPUT_FOLDER = Path("stories")
-PROMPT_FILE = Path("PROMPT.md")
-
-# Speech normalization
+TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
+DEFAULT_VOICE = "bm_george"
+DEFAULT_SPEED = 0.8
+DEFAULT_BACKGROUND_VOLUME = 0.2
 TARGET_LOUDNESS = -23
 MAX_TRUE_PEAK = -2
 LOUDNESS_RANGE = 7
-
-# Models
-#LLM_PATH = "mlx-community/gemma-4-e4b-it-OptiQ-4bit"
-LLM_PATH = "mlx-community/Qwen3-14B-4bit"
-TTS_PATH = "mlx-community/Kokoro-82M-bf16"
-
-os.environ["ESPEAK_DATA_PATH"] = str(Path(espeakng_loader.get_data_path()).parent)
-
-print("--- Loading Engines ---")
-with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-    model, tokenizer, *_ = load(LLM_PATH)
-    tokenizer: Any
-    tts_model: Any = load_tts(TTS_PATH)  # type: ignore[arg-type]
-
-print("✅ Engines Ready.")
+# Leave extra room for AAC reconstruction peaks after limiting a loud mix.
+MIX_HEADROOM_DB = 1
+# Kokoro voice names encode the language in their first character.
+LANGUAGE_CODES = frozenset("abefhijpz")
 
 
-def parse_prompt(file_path: Path) -> list[dict[str, str]]:
-    content = file_path.read_text(encoding="utf-8")
-    sections = re.split(r"^#\s+", content, flags=re.MULTILINE)
-
-    system_content = ""
-    user_content = []
-
-    for section in sections:
-        if not section.strip():
-            continue
-        lines = section.split("\n", 1)
-        header = lines[0].strip().lower()
-        body = lines[1].strip() if len(lines) > 1 else ""
-
-        if "system prompt" in header:
-            system_content = body
-        else:
-            user_content.append(f"# {section.strip()}")
-
-    messages = []
-    if system_content:
-        messages.append({"role": "system", "content": system_content})
-    if user_content:
-        messages.append({"role": "user", "content": "\n\n".join(user_content)})
-    return messages
+def positive_speed(value: str) -> float:
+    speed = float(value)
+    if not math.isfinite(speed) or speed <= 0:
+        raise argparse.ArgumentTypeError("Speed must be a finite number greater than zero.")
+    return speed
 
 
-def strip_thinking(text: str) -> str:
-    text = re.sub(r"<\|channel>.*?<channel\|>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<\|channel>.*", "", text, flags=re.DOTALL)
-    return text.strip()
+def background_volume(value: str) -> float:
+    volume = float(value)
+    if not math.isfinite(volume) or volume < 0:
+        raise argparse.ArgumentTypeError("Background volume must be finite and nonnegative.")
+    return volume
 
 
-def extract_title(story_raw: str) -> tuple[str, str]:
-    lines = [line.strip() for line in story_raw.splitlines() if line.strip()]
-
-    for i, line in enumerate(lines):
-        if m := re.match(r"^(?:#+\s*|\*{2,})(.+?)\*{0,2}$", line):
-            extracted_title = m.group(1).strip()
-            story_body = "\n".join(lines[i + 1 :]).strip()
-            return extracted_title, story_body
-
-    return "Untitled Cyberpunk Story", "\n".join(lines).strip()
+def voice_language(voice: str) -> str:
+    if not re.fullmatch(r"[a-z][fm]_[a-z0-9_]+", voice) or voice[0] not in LANGUAGE_CODES:
+        raise ValueError(f"Unsupported Kokoro voice name: {voice!r}")
+    return voice[0]
 
 
-def generate_story() -> dict[str, Any]:
-    messages = parse_prompt(PROMPT_FILE)
-    prompt = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "input", nargs="?", type=Path, help="UTF-8 text file; omit or use - for stdin"
     )
-
-    sampler = make_sampler(temp=TEMP, top_p=TOP_P)
-    logits_processors = make_logits_processors(
-        repetition_penalty=REPETITION_PENALTY,
-        repetition_context_size=REPETITION_CONTEXT_SIZE,
+    parser.add_argument(
+        "-o", "--output", type=Path, help="Exact output path; must not already exist"
     )
-
-    print("--- Generating Story (this may take a minute) ---")
-    start_text = time.perf_counter()
-    response_raw = generate(
-        model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=2000,
-        sampler=sampler,
-        logits_processors=logits_processors,
+    parser.add_argument(
+        "--voice", default=DEFAULT_VOICE, help=f"Kokoro voice (default: {DEFAULT_VOICE})"
     )
-    story_raw = strip_thinking(response_raw)
-    end_text = time.perf_counter()
+    parser.add_argument(
+        "--speed", type=positive_speed, default=DEFAULT_SPEED,
+        help="Narration speed multiplier (default: 0.8)",
+    )
+    parser.add_argument(
+        "--background", type=Path,
+        help="Optional audio file, looped to the narration length",
+    )
+    parser.add_argument(
+        "--background-volume", type=background_volume, default=DEFAULT_BACKGROUND_VOLUME,
+        help="Background amplitude multiplier (default: %(default)s; 0 mutes it)",
+    )
+    return parser
 
-    title, body = extract_title(story_raw)
-    tokens = len(tokenizer.encode(story_raw))
 
-    return {
-        "title": title,
-        "body": body,
-        "token_per_sec": tokens / (end_text - start_text),
-    }
+def read_text(input_path: Path | None) -> str:
+    if input_path is not None:
+        if not sys.stdin.isatty() and sys.stdin.read().strip():
+            raise ValueError("Provide either an input file or piped text, not both.")
+        text = input_path.read_text(encoding="utf-8")
+    else:
+        if sys.stdin.isatty():
+            raise ValueError("Provide an input file or pipe text into the command.")
+        text = sys.stdin.read()
+    if not text.strip():
+        raise ValueError("The input text is empty.")
+    return text
 
 
-def write_audio(filename: Path, title: str, story: str) -> float:
-    loudnorm_filter = f"loudnorm=I={TARGET_LOUDNESS}:TP={MAX_TRUE_PEAK}:LRA={LOUDNESS_RANGE}:linear=true"
+def reserve_output(input_path: Path | None, output_path: Path | None) -> Path:
+    """Reserve a name exclusively so existing recordings cannot be overwritten."""
+    base = output_path or (input_path.with_suffix(".m4b") if input_path else Path("narration.m4b"))
+    counter = 0
+    while True:
+        candidate = base if counter == 0 else base.with_name(f"{base.stem}_{counter}{base.suffix}")
+        try:
+            with candidate.open("xb"):
+                pass
+            return candidate
+        except FileExistsError:
+            if output_path is not None:
+                raise ValueError(f"Output file already exists: {output_path}") from None
+            counter += 1
 
-    if BACKGROUND_SOUND and BACKGROUND_SOUND.exists():
-        filter_str = (
-            f"[0:a]{loudnorm_filter}[v]; "
-            f"[1:a]volume={BACKGROUND_VOLUME}[r]; "
-            f"[v][r]amix=inputs=2:duration=first:dropout_transition=2[mixed]"
+
+def load_engine() -> Any:
+    # Keep --help and input validation independent of MLX and its GPU requirements.
+    import espeakng_loader
+    from mlx_audio.tts.utils import load_model
+
+    os.environ["ESPEAK_DATA_PATH"] = str(Path(espeakng_loader.get_data_path()).parent)
+    print(f"Loading {TTS_MODEL}...", file=sys.stderr)
+    with contextlib.redirect_stdout(sys.stderr):
+        return load_model(TTS_MODEL)
+
+
+def ffmpeg_command(
+    executable: str, filename: Path, sample_rate: int,
+    background: Path | None, volume: float,
+) -> list[str]:
+    loudnorm = (
+        f"loudnorm=I={TARGET_LOUDNESS}:TP={MAX_TRUE_PEAK}:"
+        f"LRA={LOUDNESS_RANGE}:linear=true"
+    )
+    command = [
+        executable, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+        "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", "pipe:0",
+    ]
+    if background is not None:
+        limit = 10 ** ((MAX_TRUE_PEAK - MIX_HEADROOM_DB) / 20)
+        filters = (
+            f"[0:a:0]{loudnorm}[voice];"
+            f"[1:a:0]aformat=channel_layouts=mono,volume={volume}[background];"
+            "[voice][background]amix=inputs=2:duration=first:normalize=0,"
+            f"alimiter=limit={limit}:level=false:latency=true[mixed]"
         )
-        command = [
-            "ffmpeg", "-y",
-            "-f", "s16le", "-ar", "24000", "-ac", "1",
-            "-i", "pipe:0",
-            "-stream_loop", "-1", "-i", str(BACKGROUND_SOUND),
-            "-filter_complex", filter_str,
-            "-map", "[mixed]",
-            "-ac", "1", "-c:a", "aac", "-b:a", "64k",
-            "-metadata", f"title={title}",
-            "-metadata", "genre=Audiobook",
-            "-metadata:s:a:0", "media_type=10",
-            str(filename),
+        command += [
+            "-stream_loop", "-1", "-i", str(background),
+            "-filter_complex", filters, "-map", "[mixed]",
         ]
     else:
-        command = [
-            "ffmpeg", "-y",
-            "-f", "s16le", "-ar", "24000", "-ac", "1",
-            "-i", "pipe:0",
-            "-af", loudnorm_filter,
-            "-ac", "1", "-c:a", "aac", "-b:a", "64k",
-            "-metadata", f"title={title}",
-            "-metadata", "genre=Audiobook",
-            "-metadata:s:a:0", "media_type=10",
-            str(filename),
-        ]
+        command += ["-map", "0:a:0", "-af", loudnorm]
+    command += [
+        "-ar", str(sample_rate), "-ac", "1", "-c:a", "aac", "-b:a", "64k",
+        "-map_metadata", "-1", "-metadata", f"title={filename.stem}",
+        "-metadata", "genre=Audiobook", "-f", "ipod", str(filename.resolve()),
+    ]
+    return command
 
-    process = subprocess.Popen(
-        command, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
-    )
 
-    start_audio = time.perf_counter()
-    total_samples = 0.0
-
-    print(f"--- Generating Audio: {title} ---")
+def stop_process(process: subprocess.Popen) -> None:
+    if process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            process.terminate()
     try:
-        assert process.stdin is not None
-        for result in tts_model.generate(story, voice=VOICE, lang_code=LANG, speed=SPEED):
-            audio_np = np.array(result.audio)
-            samples = (audio_np * 32767).astype(np.int16).tobytes()
-            total_samples += len(samples) / 2
-            process.stdin.write(samples)
-    finally:
-        if process.stdin:
-            process.stdin.close()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
         process.wait()
 
-    if process.returncode != 0:
-        raise RuntimeError(f"FFmpeg failed with exit code {process.returncode}")
 
-    end_audio = time.perf_counter()
-    return (total_samples / 24000) / (end_audio - start_audio)
+def write_audio(
+    filename: Path, text: str, model: Any, voice: str, speed: float,
+    background: Path | None, volume: float, executable: str,
+) -> float:
+    import numpy as np
+
+    sample_rate = model.sample_rate
+    command = ffmpeg_command(executable, filename, sample_rate, background, volume)
+    started = time.perf_counter()
+    total_samples = 0
+
+    # A file-backed error stream cannot fill up and deadlock the PCM pipe.
+    with tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=errors
+        )
+        assert process.stdin is not None
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                for result in model.generate(
+                    text, voice=voice, lang_code=voice_language(voice), speed=speed
+                ):
+                    if result.sample_rate != sample_rate:
+                        raise RuntimeError("TTS changed its sample rate during generation.")
+                    audio = np.asarray(result.audio)
+                    if audio.ndim != 1 or not np.isfinite(audio).all():
+                        raise RuntimeError("TTS returned invalid mono audio samples.")
+                    pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
+                    process.stdin.write(pcm)
+                    total_samples += audio.size
+            if total_samples == 0:
+                raise RuntimeError("TTS returned no audio samples.")
+        except BaseException as error:
+            stop_process(process)
+            if isinstance(error, BrokenPipeError):
+                errors.seek(0)
+                detail = errors.read().decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"FFmpeg stopped accepting audio: {detail}") from error
+            raise
+        finally:
+            with contextlib.suppress(OSError):
+                process.stdin.close()
+        try:
+            returncode = process.wait()
+        except BaseException:
+            stop_process(process)
+            raise
+        if returncode != 0:
+            errors.seek(0)
+            detail = errors.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"FFmpeg failed (exit {returncode}): {detail}")
+
+    return (total_samples / sample_rate) / (time.perf_counter() - started)
 
 
-def main():
-    if BACKGROUND_SOUND and not BACKGROUND_SOUND.exists():
-        print(f"Error: Background sound sound file '{BACKGROUND_SOUND}' missing.")
-        sys.exit(1)
-
-    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
-    import_story_path: Path | None = None
-
-    if import_story_path and import_story_path.exists():
-        raw = import_story_path.read_text(encoding="utf-8")
-        title, body = extract_title(raw)
-        story = {"title": title, "body": body, "token_per_sec": None}
-    else:
-        story = generate_story()
-
-    safe_base = re.sub(r"[^\w\s-]", "", story["title"]).replace(" ", "_").lower()
-
-    if not import_story_path:
-        text_filename = OUTPUT_FOLDER / f"{safe_base}.md"
-        text_filename.write_text(f"{story['title']}\n\n{story['body']}", encoding="utf-8")
-
-    audio_filename = OUTPUT_FOLDER / f"{safe_base}.m4b"
-    audio_speed = write_audio(audio_filename, story["title"], story["body"])
-
-    tps_val = story['token_per_sec']
-    tps = f"{tps_val:.2f} tokens/sec" if isinstance(tps_val, float) else "N/A"
-    audio_x = f"{audio_speed:.2f}x realtime"
-
-    print("\n" + "=" * 40)
-    print(f"📖 STORY: {story['title']}")
-    print("=" * 40)
-    print(f"LLM:   {tps}")
-    print(f"Audio: {audio_x}")
-    print("=" * 40 + "\n")
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    output = None
+    complete = False
+    try:
+        voice_language(args.voice)
+        input_path = None if args.input == Path("-") else args.input
+        text = read_text(input_path)
+        if args.background is not None and not args.background.is_file():
+            raise ValueError(f"Background audio file does not exist: {args.background}")
+        executable = shutil.which("ffmpeg")
+        if executable is None:
+            raise RuntimeError("FFmpeg is required. Install it with: brew install ffmpeg")
+        output = reserve_output(input_path, args.output)
+        model = load_engine()
+        print(f"Narrating with {args.voice} at {args.speed}x speed...", file=sys.stderr)
+        realtime = write_audio(
+            output, text, model, args.voice, args.speed,
+            args.background, args.background_volume, executable,
+        )
+        complete = True
+        print(f"Saved {output} ({realtime:.2f}x realtime).", file=sys.stderr)
+        return 0
+    except KeyboardInterrupt:
+        print("Audio generation cancelled.", file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+    finally:
+        if output is not None and not complete:
+            output.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
