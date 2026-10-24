@@ -50,7 +50,7 @@ def voice_language(voice: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "input", nargs="?", type=Path, help="UTF-8 text file; omit or use - for stdin"
+        "input", nargs="?", type=Path, help="UTF-8 text file; omit for stdin"
     )
     parser.add_argument(
         "-o", "--output", type=Path, help="Exact output path; must not already exist"
@@ -113,7 +113,7 @@ def load_engine() -> Any:
     with contextlib.redirect_stdout(sys.stderr):
         return load_model(TTS_MODEL)
 
-
+# fmt: off
 def ffmpeg_command(
     executable: str, filename: Path, sample_rate: int,
     background: Path | None, volume: float,
@@ -141,12 +141,12 @@ def ffmpeg_command(
     else:
         command += ["-map", "0:a:0", "-af", loudnorm]
     command += [
-        "-ar", str(sample_rate), "-ac", "1", "-c:a", "aac", "-b:a", "64k",
+        "-ar", str(sample_rate), "-ac", "1", "-c:a", "aac", "-b:a", "96k",
         "-map_metadata", "-1", "-metadata", f"title={filename.stem}",
         "-metadata", "genre=Audiobook", "-f", "ipod", str(filename.resolve()),
     ]
     return command
-
+# fmt: on
 
 def stop_process(process: subprocess.Popen) -> None:
     if process.poll() is None:
@@ -220,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
     complete = False
     try:
         voice_language(args.voice)
-        input_path = None if args.input == Path("-") else args.input
+        input_path = args.input
         text = read_text(input_path)
         if args.background is not None and not args.background.is_file():
             raise ValueError(f"Background audio file does not exist: {args.background}")

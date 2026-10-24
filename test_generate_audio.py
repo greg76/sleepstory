@@ -70,20 +70,19 @@ class AudioCommandTests(unittest.TestCase):
                 background, 0.1, "ffmpeg",
             )
 
-    def test_piped_input_and_explicit_stdin(self):
+    def test_piped_input(self):
         with tempfile.TemporaryDirectory() as directory:
-            for index, args in enumerate([[], ["-"]]):
-                output = Path(directory) / f"out{index}.m4b"
-                with (
-                    patch.object(audio, "load_engine"),
-                    patch.object(audio, "write_audio", return_value=1.0) as write,
-                    patch.object(audio.shutil, "which", return_value="ffmpeg"),
-                ):
-                    status, stdout, _ = self.invoke(
-                        args + ["-o", str(output)], "Entire text\n\nEnd."
-                    )
-                self.assertEqual((status, stdout), (0, ""))
-                self.assertEqual(write.call_args.args[1], "Entire text\n\nEnd.")
+            output = Path(directory) / "out.m4b"
+            with (
+                patch.object(audio, "load_engine"),
+                patch.object(audio, "write_audio", return_value=1.0) as write,
+                patch.object(audio.shutil, "which", return_value="ffmpeg"),
+            ):
+                status, stdout, _ = self.invoke(
+                    ["-o", str(output)], "Entire text\n\nEnd."
+                )
+            self.assertEqual((status, stdout), (0, ""))
+            self.assertEqual(write.call_args.args[1], "Entire text\n\nEnd.")
 
     def test_invalid_input_does_not_load_model(self):
         with tempfile.TemporaryDirectory() as directory:

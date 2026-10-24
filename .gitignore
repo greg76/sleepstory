@@ -1,3 +1,7 @@
 .DS_Store
-stories/
-rain.m4a
+__pycache__/
+/stories
+*.m4[ab]
+*.mp3
+__pycache__/
+.venv/
