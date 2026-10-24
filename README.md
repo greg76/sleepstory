@@ -59,7 +59,7 @@ python3 generate_story.py "A peaceful woodland walk" --yes | python3 generate_au
   Use `af_heart` for American English or `ff_siwis` for French. Japanese and
   Mandarin voices require `misaki[ja]` and `misaki[zh]`, respectively.
 - Background audio loops to match the narration. `--background-volume` scales
-  its amplitude, defaults to `0.2`, and accepts `0` to mute it. Adjust by ear.
+  its amplitude, defaults to `0.2`, and accepts `0` to mute it. Adjust by ear. (example for royalty free background sounds: [Pixabay](https://pixabay.com/sound-effects/search/rain/))
 - File input saves an M4B beside the source with the same filename stem; stdin
   saves as `narration.m4b`. Automatic names add `_1`, `_2`, etc. to avoid overwriting.
   Use `-o FILE` for an exact path.
