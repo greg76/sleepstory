@@ -4,7 +4,7 @@ Create sleep stories and narrated audiobooks locally on your Mac. Generate a
 story from a prompt, narrate existing text, or combine both, with optional
 background audio.
 
-![The AI dreams of Virtual Reality](cover.png)
+![The AI dreams of Virtual Reality](cover.jpg)
 
 ## Setup
 
@@ -45,28 +45,58 @@ about 2.3 GB. The Apple backend needs no Python packages.
 ## Generate audio
 
 `generate_audio.py` narrates a UTF-8 text file or stdin using
-`mlx-community/Kokoro-82M-bf16` and saves an M4B audiobook. It reads all text,
+`mlx-community/Ming-3.0-tts-0.5B-bf16` and saves an M4B audiobook. It reads all text,
 including headings, so use plain text for narration.
 
 ```bash
 python3 generate_audio.py story.txt
-python3 generate_audio.py story.txt --voice af_heart --speed 1.0
+python3 generate_audio.py story.txt --voice US_Emma
 python3 generate_audio.py story.txt --background rain.m4a --background-volume 0.2
 python3 generate_story.py "A peaceful woodland walk" --yes | python3 generate_audio.py -o woodland.m4b
 ```
 
-- Defaults: British English voice `bm_george`, speed `0.8`, no background audio.
-  Use `af_heart` for American English or `ff_siwis` for French. Japanese and
-  Mandarin voices require `misaki[ja]` and `misaki[zh]`, respectively.
+- Default voice: British English `UK_George`. Override with `--voice UK_Charlotte`,
+  `US_James`, `US_Emma`, or `US_Stella` (case-sensitive).
+  Narration currently supports English. The former `--speed` option is removed.
+- Delivery instructions are fixed to slow speed (`慢速`), low pitch (`低`), and
+  medium volume (`中`) for the selected voice. These are model hints; the audition
+  showed a modest speed effect but unreliable pitch and volume control.
+- Ming handles sentence splitting and streams bounded fragments to the encoder.
+  Blank lines add a 0.8-second paragraph pause. Write numbers, dates, and unusual
+  abbreviations as spoken words for reliable pronunciation.
+- The dense model uses BF16 weights and downloads on first use.
+- Ming 3 requires newer code than MLX-Audio 0.6.0. Requirements currently use
+  upstream `main`; this dependency is not yet reproducibly pinned because the
+  upstream commit could not be resolved during implementation.
 - Background audio loops to match the narration. `--background-volume` scales
   its amplitude, defaults to `0.2`, and accepts `0` to mute it. Adjust by ear. (example for royalty free background sounds: [Pixabay](https://pixabay.com/sound-effects/search/rain/))
 - File input saves an M4B beside the source with the same filename stem; stdin
   saves as `narration.m4b`. Automatic names add `_1`, `_2`, etc. to avoid overwriting.
   Use `-o FILE` for an exact path.
-- Output is mono AAC at 96 kbit/s, with narration loudness normalized.
+- Output is 44.1 kHz mono AAC at 96 kbit/s, with narration loudness normalized.
+  Background mixing and M4B encoding run in a single FFmpeg pass.
 
 Both generators refuse to overwrite paths supplied with `-o`; destination
 directories must exist. Status messages and errors go to stderr.
+
+## Audition basic speech controls
+
+```bash
+python3 audition_basic_controls.py
+python3 audition_basic_controls.py --text-file passage.txt --output-dir comparisons/basic-test
+```
+
+Generates all eight combinations of slow/medium speed, low/medium pitch, and
+medium/high volume for dense `UK_George`, plus an unchanged baseline. Every
+recording uses identical text and a reset seed (default 42; override with
+`--seed`). Combined built-in voice and basic controls are experimental: listen
+for whether controls take effect and whether George's identity is preserved.
+
+Files are raw floating-point WAV without normalization or background mixing, so
+volume differences remain audible. Keep player volume fixed and disable playback
+loudness normalization. Filenames identify each combination; `audition.json`
+records the exact controls, durations, peaks, and RMS amplitudes. Existing output
+directories are refused. Production narration settings remain unchanged.
 
 ## Tests
 

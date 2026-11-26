@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import wave
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -26,26 +27,26 @@ class AudioCommandTests(unittest.TestCase):
             status = audio.main(args)
         return status, stdout.getvalue(), stderr.getvalue()
 
-    def test_voice_language(self):
-        for voice, language in [("bm_george", "b"), ("af_heart", "a"), ("ff_siwis", "f")]:
-            self.assertEqual(audio.voice_language(voice), language)
-        for invalid in ["", "unknown", "xm_unknown", "../../bm_george"]:
-            with self.assertRaises(ValueError):
-                audio.voice_language(invalid)
-
-    def test_speed_and_volume_validation(self):
-        for option, values in [
-            ("--speed", ["0", "-1", "nan", "inf"]),
-            ("--background-volume", ["-1", "nan", "inf"]),
-        ]:
-            for value in values:
-                with (
-                    self.subTest(option=option, value=value),
-                    contextlib.redirect_stderr(io.StringIO()),
-                    self.assertRaises(SystemExit),
-                ):
-                    audio.build_parser().parse_args([option, value])
+    def test_defaults_and_removed_options(self):
+        args = audio.build_parser().parse_args([])
+        self.assertEqual(args.voice, "UK_George")
+        for voice in audio.VOICES:
+            self.assertEqual(audio.build_parser().parse_args(["--voice", voice]).voice, voice)
+        for args in [["--speed", "0.8"], ["--voice", "bm_george"],
+                     ["--background-volume", "nan"], ["--background-volume", "-1"]]:
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                audio.build_parser().parse_args(args)
         self.assertEqual(audio.background_volume("0"), 0)
+
+    def test_delivery_controls_preserve_selected_voice(self):
+        module = SimpleNamespace(ming3_instruction=lambda **kwargs: kwargs)
+        with patch.dict(sys.modules, {"mlx_audio.tts.models.bailingmm.bailingmm": module}):
+            for voice in audio.VOICES:
+                options = audio.generation_options(voice)
+                self.assertEqual(options["instruct"], {
+                    "ip": voice, "speed": "慢速", "pitch": "低", "volume": "中",
+                })
+                self.assertNotIn("voice", options)
 
     def test_file_input_preserves_all_text_and_passes_options(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -61,12 +62,12 @@ class AudioCommandTests(unittest.TestCase):
                 patch.object(audio.shutil, "which", return_value="ffmpeg"),
             ):
                 status, stdout, _ = self.invoke([
-                    str(source), "--voice", "af_heart", "--speed", "1.1",
+                    str(source), "--voice", "US_Emma",
                     "--background", str(background), "--background-volume", "0.1",
                 ])
             self.assertEqual((status, stdout), (0, ""))
             write.assert_called_once_with(
-                source.with_suffix(".m4b"), text, model, "af_heart", 1.1,
+                source.with_suffix(".m4b"), text, model, "US_Emma",
                 background, 0.1, "ffmpeg",
             )
 
@@ -83,6 +84,7 @@ class AudioCommandTests(unittest.TestCase):
                 )
             self.assertEqual((status, stdout), (0, ""))
             self.assertEqual(write.call_args.args[1], "Entire text\n\nEnd.")
+            self.assertEqual(write.call_args.args[3], "UK_George")
 
     def test_invalid_input_does_not_load_model(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -91,7 +93,6 @@ class AudioCommandTests(unittest.TestCase):
                 ([], ""), ([missing], ""),
                 ([missing], "Also piped"),
                 (["--background", missing], "A story"),
-                (["--voice", "xx_invalid"], "A story"),
             ]:
                 with patch.object(audio, "load_engine") as load:
                     status, stdout, stderr = self.invoke(args, stdin)
@@ -148,7 +149,7 @@ class AudioCommandTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is not installed")
 class MixingTests(unittest.TestCase):
-    sample_rate = 24000
+    sample_rate = 44100
 
     def sine_pcm(self, seconds, amplitude, frequency):
         samples = array.array("h", (
@@ -179,6 +180,45 @@ class MixingTests(unittest.TestCase):
             output.setframerate(self.sample_rate)
             output.writeframes(self.sine_pcm(0.25, amplitude, 220))
 
+    def test_ming_paragraphs_stream_in_order_with_one_pause(self):
+        import numpy as np
+
+        class Model:
+            sample_rate = 44100
+
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, text, **kwargs):
+                self.calls.append((text, kwargs))
+                for _ in range(2):
+                    yield SimpleNamespace(audio=np.zeros(4410), sample_rate=self.sample_rate)
+
+        model = Model()
+        captured = io.BytesIO()
+        process = SimpleNamespace(
+            stdin=captured, poll=lambda: 0, wait=lambda: 0,
+        )
+        # Keep captured bytes available after write_audio closes the pipe.
+        instruction_module = SimpleNamespace(ming3_instruction=lambda **kwargs: kwargs)
+        with (
+            patch.dict(sys.modules, {
+                "mlx_audio.tts.models.bailingmm.bailingmm": instruction_module,
+            }),
+            patch.object(captured, "close"),
+            patch.object(audio.subprocess, "Popen", return_value=process),
+        ):
+            audio.write_audio(Path("unused.m4b"), "First.\n\nSecond.\n", model,
+                              "UK_George", None, 0.2, "ffmpeg")
+        self.assertEqual([call[0] for call in model.calls], ["First.", "Second."])
+        self.assertTrue(all(call[1] == {
+            "instruct": {"ip": "UK_George", "speed": "慢速", "pitch": "低", "volume": "中"},
+            "use_zero_spk_emb": True, "lang_code": "en", "stream": True,
+        }
+                            for call in model.calls))
+        expected_samples = 4 * 4410 + round(44100 * audio.PARAGRAPH_PAUSE_SECONDS)
+        self.assertEqual(len(captured.getvalue()), expected_samples * 2)
+
     def test_normalization_and_zero_background_preserve_narration_level_and_length(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -202,7 +242,7 @@ class MixingTests(unittest.TestCase):
                 root / "mixed.m4b", self.sine_pcm(3, 0.005, 440), background, 2
             )
             peak = max(abs(x) for x in mixed)
-            self.assertGreater(peak, 0.7)
+            self.assertGreater(peak, 0.5)
             self.assertLess(peak, 1)
 
 

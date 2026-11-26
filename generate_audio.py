@@ -4,7 +4,6 @@
 import argparse
 import contextlib
 import math
-import os
 import re
 import shutil
 import subprocess
@@ -14,24 +13,17 @@ import time
 from pathlib import Path
 from typing import Any
 
-TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
-DEFAULT_VOICE = "bm_george"
-DEFAULT_SPEED = 0.8
+TTS_MODEL = "mlx-community/Ming-3.0-tts-0.5B-bf16"
+DEFAULT_VOICE = "UK_George"
+# Limit the CLI to documented English presets; Ming silently ignores unknown voices.
+VOICES = ("UK_George", "UK_Charlotte", "US_James", "US_Emma", "US_Stella")
+PARAGRAPH_PAUSE_SECONDS = 0.8
 DEFAULT_BACKGROUND_VOLUME = 0.2
 TARGET_LOUDNESS = -23
 MAX_TRUE_PEAK = -2
 LOUDNESS_RANGE = 7
 # Leave extra room for AAC reconstruction peaks after limiting a loud mix.
-MIX_HEADROOM_DB = 1
-# Kokoro voice names encode the language in their first character.
-LANGUAGE_CODES = frozenset("abefhijpz")
-
-
-def positive_speed(value: str) -> float:
-    speed = float(value)
-    if not math.isfinite(speed) or speed <= 0:
-        raise argparse.ArgumentTypeError("Speed must be a finite number greater than zero.")
-    return speed
+MIX_HEADROOM_DB = 4
 
 
 def background_volume(value: str) -> float:
@@ -39,12 +31,6 @@ def background_volume(value: str) -> float:
     if not math.isfinite(volume) or volume < 0:
         raise argparse.ArgumentTypeError("Background volume must be finite and nonnegative.")
     return volume
-
-
-def voice_language(voice: str) -> str:
-    if not re.fullmatch(r"[a-z][fm]_[a-z0-9_]+", voice) or voice[0] not in LANGUAGE_CODES:
-        raise ValueError(f"Unsupported Kokoro voice name: {voice!r}")
-    return voice[0]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,11 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-o", "--output", type=Path, help="Exact output path; must not already exist"
     )
     parser.add_argument(
-        "--voice", default=DEFAULT_VOICE, help=f"Kokoro voice (default: {DEFAULT_VOICE})"
-    )
-    parser.add_argument(
-        "--speed", type=positive_speed, default=DEFAULT_SPEED,
-        help="Narration speed multiplier (default: 0.8)",
+        "--voice", choices=VOICES, default=DEFAULT_VOICE,
+        help=f"Ming English voice (default: {DEFAULT_VOICE})"
     )
     parser.add_argument(
         "--background", type=Path,
@@ -105,13 +88,17 @@ def reserve_output(input_path: Path | None, output_path: Path | None) -> Path:
 
 def load_engine() -> Any:
     # Keep --help and input validation independent of MLX and its GPU requirements.
-    import espeakng_loader
     from mlx_audio.tts.utils import load_model
 
-    os.environ["ESPEAK_DATA_PATH"] = str(Path(espeakng_loader.get_data_path()).parent)
     print(f"Loading {TTS_MODEL}...", file=sys.stderr)
     with contextlib.redirect_stdout(sys.stderr):
-        return load_model(TTS_MODEL)
+        model = load_model(TTS_MODEL)
+    if not getattr(model, "ming3", False):
+        raise RuntimeError(
+            "This MLX-Audio installation lacks Ming 3 dense support. "
+            "Install the dependencies from requirements.txt."
+        )
+    return model
 
 # fmt: off
 def ffmpeg_command(
@@ -159,12 +146,26 @@ def stop_process(process: subprocess.Popen) -> None:
         process.wait()
 
 
+def generation_options(voice: str) -> dict[str, Any]:
+    from mlx_audio.tts.models.bailingmm.bailingmm import ming3_instruction
+
+    return {
+        "instruct": ming3_instruction(
+            ip=voice, speed="慢速", pitch="低", volume="中",
+        ),
+        "use_zero_spk_emb": True,
+        "lang_code": "en",
+        "stream": True,
+    }
+
+
 def write_audio(
-    filename: Path, text: str, model: Any, voice: str, speed: float,
+    filename: Path, text: str, model: Any, voice: str,
     background: Path | None, volume: float, executable: str,
 ) -> float:
     import numpy as np
 
+    options = generation_options(voice)
     sample_rate = model.sample_rate
     command = ffmpeg_command(executable, filename, sample_rate, background, volume)
     started = time.perf_counter()
@@ -178,17 +179,26 @@ def write_audio(
         assert process.stdin is not None
         try:
             with contextlib.redirect_stdout(sys.stderr):
-                for result in model.generate(
-                    text, voice=voice, lang_code=voice_language(voice), speed=speed
-                ):
-                    if result.sample_rate != sample_rate:
-                        raise RuntimeError("TTS changed its sample rate during generation.")
-                    audio = np.asarray(result.audio)
-                    if audio.ndim != 1 or not np.isfinite(audio).all():
-                        raise RuntimeError("TTS returned invalid mono audio samples.")
-                    pcm = (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes()
-                    process.stdin.write(pcm)
-                    total_samples += audio.size
+                # Ming splits paragraphs into bounded fragments and yields each when ready.
+                paragraphs = re.split(r"\n[ \t]*\n", text.strip())
+                pause = bytes(round(sample_rate * PARAGRAPH_PAUSE_SECONDS) * 2)
+                for index, paragraph in enumerate(p for p in paragraphs if p.strip()):
+                    if index:
+                        process.stdin.write(pause)
+                        total_samples += len(pause) // 2
+                    paragraph_samples = 0
+                    for result in model.generate(paragraph, **options):
+                        if result.sample_rate != sample_rate:
+                            raise RuntimeError("TTS changed its sample rate during generation.")
+                        samples = np.asarray(result.audio)
+                        if samples.ndim != 1 or not np.isfinite(samples).all():
+                            raise RuntimeError("TTS returned invalid mono audio samples.")
+                        pcm = (np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes()
+                        process.stdin.write(pcm)
+                        paragraph_samples += samples.size
+                    if paragraph_samples == 0:
+                        raise RuntimeError("TTS returned no audio samples for a paragraph.")
+                    total_samples += paragraph_samples
             if total_samples == 0:
                 raise RuntimeError("TTS returned no audio samples.")
         except BaseException as error:
@@ -219,7 +229,6 @@ def main(argv: list[str] | None = None) -> int:
     output = None
     complete = False
     try:
-        voice_language(args.voice)
         input_path = args.input
         text = read_text(input_path)
         if args.background is not None and not args.background.is_file():
@@ -229,9 +238,9 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("FFmpeg is required. Install it with: brew install ffmpeg")
         output = reserve_output(input_path, args.output)
         model = load_engine()
-        print(f"Narrating with {args.voice} at {args.speed}x speed...", file=sys.stderr)
+        print(f"Narrating with {args.voice}...", file=sys.stderr)
         realtime = write_audio(
-            output, text, model, args.voice, args.speed,
+            output, text, model, args.voice,
             args.background, args.background_volume, executable,
         )
         complete = True
